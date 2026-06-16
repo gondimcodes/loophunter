@@ -53,29 +53,47 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
     } else if prefix_len < 56 {
         56
     } else {
-        return vec![
-            IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
-            IpAddr::V6(Ipv6Addr::from(start_bits + 2)),
-        ];
+        // For smaller blocks (prefix length >= 56), define targets according to the available space
+        let step = 128 - prefix_len;
+        if step == 0 {
+            return vec![IpAddr::V6(Ipv6Addr::from(start_bits))];
+        } else if step == 1 {
+            return vec![
+                IpAddr::V6(Ipv6Addr::from(start_bits)),
+                IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
+            ];
+        } else {
+            return vec![
+                IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
+                IpAddr::V6(Ipv6Addr::from(start_bits + (1u128 << (step - 1)))),
+                IpAddr::V6(Ipv6Addr::from(start_bits + (1u128 << step) - 1)),
+            ];
+        }
     };
 
-    let step = 128 - target_sub_len;
+    let step = 128 - target_sub_len; // 80 for /48, 72 for /56
     let num_subnets_shift = target_sub_len - prefix_len;
     
     if num_subnets_shift > 16 {
+        // Prevent subnet explosion in memory, return targets only for the base block
         return vec![
             IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
-            IpAddr::V6(Ipv6Addr::from(start_bits + 2)),
+            IpAddr::V6(Ipv6Addr::from(start_bits + (1u128 << (step - 1)))),
+            IpAddr::V6(Ipv6Addr::from(start_bits + (1u128 << step) - 1)),
         ];
     }
 
     let num_subnets = 1 << num_subnets_shift;
-    let mut targets = Vec::with_capacity(num_subnets * 2);
+    let mut targets = Vec::with_capacity(num_subnets * 3);
 
     for i in 0..num_subnets {
         let subnet_bits = start_bits + ((i as u128) << step);
+        // Beginning (::1)
         targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + 1)));
-        targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + 2)));
+        // Middle
+        targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + (1u128 << (step - 1)))));
+        // End
+        targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + (1u128 << step) - 1)));
     }
 
     targets
