@@ -417,50 +417,78 @@ async fn main() {
                     })
                     .collect();
 
+                // Group current loops by ASN and (router_ip, target_str)
+                let mut current_grouped: HashMap<String, HashMap<(String, String), BTreeSet<String>>> = HashMap::new();
                 for r in &results {
                     if let Some(router) = r.router_ip {
                         let asn_val = prefix_to_asn.get(&r.prefix).cloned().unwrap_or_else(|| "AS_UNKNOWN".to_string());
-                        if let Some(asn_res) = asn_results.get_mut(&asn_val) {
-                            let target_str = if r.target_ip.is_ipv6() {
-                                get_ipv6_subblock(r.target_ip, &r.prefix)
-                            } else {
-                                r.target_ip.to_string()
-                            };
-                            let is_new = if r.target_ip.is_ipv6() {
-                                asn_res.current_loops.insert(format!("{} - {} (target: {})", router, target_str, r.target_ip))
-                            } else {
-                                asn_res.current_loops.insert(format!("{} - {}", router, target_str))
-                            };
-                            if is_new {
-                                if r.target_ip.is_ipv6() {
-                                    asn_res.current_v6_count += 1;
-                                } else {
-                                    asn_res.current_v4_count += 1;
-                                }
-                            }
-                        }
+                        let target_str = if r.target_ip.is_ipv6() {
+                            get_ipv6_subblock(r.target_ip, &r.prefix)
+                        } else {
+                            r.target_ip.to_string()
+                        };
+                        current_grouped
+                            .entry(asn_val)
+                            .or_default()
+                            .entry((router.to_string(), target_str))
+                            .or_default()
+                            .insert(r.target_ip.to_string());
                     }
                 }
 
+                // Group previous loops by ASN and (router_ip, target_str)
+                let mut previous_grouped: HashMap<String, HashMap<(String, String), BTreeSet<String>>> = HashMap::new();
                 for l in &previous_saved {
                     let asn_val = prefix_to_asn.get(&l.prefix).cloned().unwrap_or_else(|| "AS_UNKNOWN".to_string());
-                    if let Some(asn_res) = asn_results.get_mut(&asn_val) {
-                        let target_ip_parsed: Result<IpAddr, _> = l.target_ip.parse();
-                        let (target_str, is_v6) = if let Ok(ip) = target_ip_parsed {
-                            if ip.is_ipv6() {
-                                (get_ipv6_subblock(ip, &l.prefix), true)
+                    let target_ip_parsed: Result<IpAddr, _> = l.target_ip.parse();
+                    let target_str = if let Ok(ip) = target_ip_parsed {
+                        if ip.is_ipv6() {
+                            get_ipv6_subblock(ip, &l.prefix)
+                        } else {
+                            l.target_ip.clone()
+                        }
+                    } else {
+                        l.target_ip.clone()
+                    };
+                    previous_grouped
+                        .entry(asn_val)
+                        .or_default()
+                        .entry((l.router_ip.clone(), target_str))
+                        .or_default()
+                        .insert(l.target_ip.clone());
+                }
+
+                // Populate the results structures grouped by ASN
+                for (asn_val, asn_res) in asn_results.iter_mut() {
+                    if let Some(groups) = current_grouped.get(asn_val) {
+                        for ((router, target_str), targets) in groups {
+                            let is_v6 = targets.iter().any(|t| t.contains(':'));
+                            let display_str = if is_v6 {
+                                let targets_joined = targets.iter().cloned().collect::<Vec<_>>().join(", ");
+                                format!("{} - {} (target: {})", router, target_str, targets_joined)
                             } else {
-                                (l.target_ip.clone(), false)
+                                format!("{} - {}", router, target_str)
+                            };
+                            asn_res.current_loops.insert(display_str);
+                            if is_v6 {
+                                asn_res.current_v6_count += 1;
+                            } else {
+                                asn_res.current_v4_count += 1;
                             }
-                        } else {
-                            (l.target_ip.clone(), false)
-                        };
-                        let display_str = if is_v6 {
-                            format!("{} - {} (target: {})", l.router_ip, target_str, l.target_ip)
-                        } else {
-                            format!("{} - {}", l.router_ip, target_str)
-                        };
-                        asn_res.previous_loops.insert(display_str);
+                        }
+                    }
+
+                    if let Some(groups) = previous_grouped.get(asn_val) {
+                        for ((router, target_str), targets) in groups {
+                            let is_v6 = targets.iter().any(|t| t.contains(':'));
+                            let display_str = if is_v6 {
+                                let targets_joined = targets.iter().cloned().collect::<Vec<_>>().join(", ");
+                                format!("{} - {} (target: {})", router, target_str, targets_joined)
+                            } else {
+                                format!("{} - {}", router, target_str)
+                            };
+                            asn_res.previous_loops.insert(display_str);
+                        }
                     }
                 }
 
