@@ -53,22 +53,29 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
     } else if prefix_len < 56 {
         56
     } else {
-        return vec![IpAddr::V6(Ipv6Addr::from(start_bits + 1))];
+        return vec![
+            IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
+            IpAddr::V6(Ipv6Addr::from(start_bits + 2)),
+        ];
     };
 
     let step = 128 - target_sub_len;
     let num_subnets_shift = target_sub_len - prefix_len;
     
     if num_subnets_shift > 16 {
-        return vec![IpAddr::V6(Ipv6Addr::from(start_bits + 1))];
+        return vec![
+            IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
+            IpAddr::V6(Ipv6Addr::from(start_bits + 2)),
+        ];
     }
 
     let num_subnets = 1 << num_subnets_shift;
-    let mut targets = Vec::with_capacity(num_subnets);
+    let mut targets = Vec::with_capacity(num_subnets * 2);
 
     for i in 0..num_subnets {
         let subnet_bits = start_bits + ((i as u128) << step);
         targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + 1)));
+        targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + 2)));
     }
 
     targets
