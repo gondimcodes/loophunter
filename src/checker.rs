@@ -167,6 +167,8 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
     let rx_socket_v6 = socket_v6.try_clone().map_err(|e| e.to_string())?;
 
     let detected_loops_clone = detected_loops.clone();
+    let non_loops = Arc::new(Mutex::new(std::collections::BTreeSet::<IpAddr>::new()));
+    let non_loops_clone = non_loops.clone();
 
     // Flag to stop the receiver threads after scanning
     let running = Arc::new(Mutex::new(true));
@@ -206,6 +208,23 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
                                     }
                                 }
                             }
+                        } else if icmp_type == 0 { // Echo Reply
+                            if sz >= ihl + 6 {
+                                let id_high = initialized_buf[ihl + 4];
+                                let id_low = initialized_buf[ihl + 5];
+                                if id_high == pid_high && id_low == pid_low {
+                                    let target_ip = Ipv4Addr::new(
+                                        initialized_buf[12],
+                                        initialized_buf[13],
+                                        initialized_buf[14],
+                                        initialized_buf[15],
+                                    );
+                                    let ip_addr = IpAddr::V4(target_ip);
+                                    if ip_to_prefixes_rx.contains_key(&ip_addr) {
+                                        non_loops_clone.lock().unwrap().insert(ip_addr);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -214,6 +233,7 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
     });
 
     let detected_loops_clone2 = detected_loops.clone();
+    let non_loops_clone2 = non_loops.clone();
     let running_clone2 = running.clone();
 
     // Spawn thread to listen for and process ICMPv6 packets
@@ -245,71 +265,107 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
                                 }
                             }
                         }
+                    } else if icmpv6_type == 129 { // Echo Reply
+                        if sz >= 8 {
+                            let id_high = initialized_buf[4];
+                            let id_low = initialized_buf[5];
+                            if id_high == pid_high && id_low == pid_low {
+                                if let Some(socket_addr) = addr.as_socket() {
+                                    if let IpAddr::V6(target_ip) = socket_addr.ip() {
+                                        let ip_addr = IpAddr::V6(target_ip);
+                                        if ip_to_prefixes_rx2.contains_key(&ip_addr) {
+                                            non_loops_clone2.lock().unwrap().insert(ip_addr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     });
 
-    // Send ICMP Echo Request packets (Ping)
-    for &target_ip in ip_to_prefixes.keys() {
-        match target_ip {
-            IpAddr::V4(addr) => {
-                let mut packet = [0u8; 64];
-                packet[0] = 8;  // Type: Echo Request
-                packet[1] = 0;  // Code: 0
-                // Checksum at packet[2..4]
-                packet[4] = pid_high; // Identifier High (from PID)
-                packet[5] = pid_low;  // Identifier Low (from PID)
-                for i in 8..64 {
-                    packet[i] = i as u8;
-                }
-                let checksum = calc_checksum(&packet);
-                packet[2] = (checksum >> 8) as u8;
-                packet[3] = (checksum & 0xff) as u8;
+    let mut remaining_targets: std::collections::BTreeSet<IpAddr> = ip_to_prefixes.keys().cloned().collect();
 
-                let dest = SocketAddr::new(IpAddr::V4(addr), 0);
-                let mut retries = 0;
-                while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
-                    if retries >= 10 {
-                        break;
+    for round in 1..=3 {
+        if remaining_targets.is_empty() {
+            break;
+        }
+
+        // Send ICMP Echo Request packets (Ping) to remaining targets
+        for &target_ip in &remaining_targets {
+            match target_ip {
+                IpAddr::V4(addr) => {
+                    let mut packet = [0u8; 64];
+                    packet[0] = 8;  // Type: Echo Request
+                    packet[1] = 0;  // Code: 0
+                    // Checksum at packet[2..4]
+                    packet[4] = pid_high; // Identifier High (from PID)
+                    packet[5] = pid_low;  // Identifier Low (from PID)
+                    for i in 8..64 {
+                        packet[i] = i as u8;
                     }
-                    retries += 1;
-                    thread::sleep(Duration::from_millis(1));
+                    let checksum = calc_checksum(&packet);
+                    packet[2] = (checksum >> 8) as u8;
+                    packet[3] = (checksum & 0xff) as u8;
+
+                    let dest = SocketAddr::new(IpAddr::V4(addr), 0);
+                    let mut retries = 0;
+                    while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
+                        if retries >= 10 {
+                            break;
+                        }
+                        retries += 1;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                IpAddr::V6(addr) => {
+                    let mut packet = [0u8; 64];
+                    packet[0] = 128; // Type: Echo Request (ICMPv6)
+                    packet[1] = 0;   // Code: 0
+                    // Checksum at packet[2..4] (written by OS)
+                    packet[4] = pid_high;  // Identifier High (from PID)
+                    packet[5] = pid_low;   // Identifier Low (from PID)
+                    for i in 8..64 {
+                        packet[i] = i as u8;
+                    }
+
+                    let dest = SocketAddr::new(IpAddr::V6(addr), 0);
+                    let mut retries = 0;
+                    while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
+                        if retries >= 10 {
+                            break;
+                        }
+                        retries += 1;
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
-            IpAddr::V6(addr) => {
-                let mut packet = [0u8; 64];
-                packet[0] = 128; // Type: Echo Request (ICMPv6)
-                packet[1] = 0;   // Code: 0
-                // Checksum at packet[2..4] (written by OS)
-                packet[4] = pid_high;  // Identifier High (from PID)
-                packet[5] = pid_low;   // Identifier Low (from PID)
-                for i in 8..64 {
-                    packet[i] = i as u8;
-                }
+            // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
+            let delay = match target_ip {
+                IpAddr::V4(_) => Duration::from_millis(1),
+                IpAddr::V6(_) => Duration::from_micros(200),
+            };
+            thread::sleep(delay);
+        }
 
-                let dest = SocketAddr::new(IpAddr::V6(addr), 0);
-                let mut retries = 0;
-                while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
-                    if retries >= 10 {
-                        break;
-                    }
-                    retries += 1;
-                    thread::sleep(Duration::from_millis(1));
-                }
+        // Wait for responses in this round (last round waits a bit longer)
+        let wait_secs = if round == 3 { 2.0 } else { 1.5 };
+        tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+
+        // Update remaining targets (remove ones that responded in any way)
+        {
+            let loops = detected_loops.lock().unwrap();
+            for ip in loops.keys() {
+                remaining_targets.remove(ip);
+            }
+            let non_loops_guard = non_loops.lock().unwrap();
+            for ip in non_loops_guard.iter() {
+                remaining_targets.remove(ip);
             }
         }
-        // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
-        let delay = match target_ip {
-            IpAddr::V4(_) => Duration::from_millis(1),
-            IpAddr::V6(_) => Duration::from_micros(200),
-        };
-        thread::sleep(delay);
     }
-
-    // Wait for responses to arrive (2 seconds timeout)
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Shutdown the receiving threads
     *running.lock().unwrap() = false;
