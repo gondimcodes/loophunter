@@ -426,7 +426,11 @@ async fn main() {
                             } else {
                                 r.target_ip.to_string()
                             };
-                            let is_new = asn_res.current_loops.insert(format!("{} - {}", router, target_str));
+                            let is_new = if r.target_ip.is_ipv6() {
+                                asn_res.current_loops.insert(format!("{} - {} (target: {})", router, target_str, r.target_ip))
+                            } else {
+                                asn_res.current_loops.insert(format!("{} - {}", router, target_str))
+                            };
                             if is_new {
                                 if r.target_ip.is_ipv6() {
                                     asn_res.current_v6_count += 1;
@@ -442,16 +446,21 @@ async fn main() {
                     let asn_val = prefix_to_asn.get(&l.prefix).cloned().unwrap_or_else(|| "AS_UNKNOWN".to_string());
                     if let Some(asn_res) = asn_results.get_mut(&asn_val) {
                         let target_ip_parsed: Result<IpAddr, _> = l.target_ip.parse();
-                        let target_str = if let Ok(ip) = target_ip_parsed {
+                        let (target_str, is_v6) = if let Ok(ip) = target_ip_parsed {
                             if ip.is_ipv6() {
-                                get_ipv6_subblock(ip, &l.prefix)
+                                (get_ipv6_subblock(ip, &l.prefix), true)
                             } else {
-                                l.target_ip.clone()
+                                (l.target_ip.clone(), false)
                             }
                         } else {
-                            l.target_ip.clone()
+                            (l.target_ip.clone(), false)
                         };
-                        asn_res.previous_loops.insert(format!("{} - {}", l.router_ip, target_str));
+                        let display_str = if is_v6 {
+                            format!("{} - {} (target: {})", l.router_ip, target_str, l.target_ip)
+                        } else {
+                            format!("{} - {}", l.router_ip, target_str)
+                        };
+                        asn_res.previous_loops.insert(display_str);
                     }
                 }
 
