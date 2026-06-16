@@ -298,6 +298,10 @@ pub async fn check_prefixes(
             break;
         }
 
+        let total_targets = remaining_targets.len();
+        let mut sent_count = 0;
+        println!("Round {}/3: Scanning {} targets...", round, total_targets);
+
         // Send ICMP Echo Request packets (Ping) to remaining targets
         for &target_ip in &remaining_targets {
             match target_ip {
@@ -347,6 +351,21 @@ pub async fn check_prefixes(
                     }
                 }
             }
+            sent_count += 1;
+            if sent_count % 100 == 0 || sent_count == total_targets {
+                let percent = (sent_count * 100) / total_targets;
+                print!("\rProgress: {}% [", percent);
+                let filled = percent / 5;
+                for _ in 0..filled {
+                    print!("=");
+                }
+                for _ in filled..20 {
+                    print!(" ");
+                }
+                print!("] ({}/{})", sent_count, total_targets);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
             // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
             let delay = match target_ip {
                 IpAddr::V4(_) => Duration::from_millis(ipv4_delay_ms),
@@ -354,6 +373,7 @@ pub async fn check_prefixes(
             };
             thread::sleep(delay);
         }
+        println!();
 
         // Wait for responses in this round (last round waits a bit longer)
         let wait_secs = if round == 3 { timeout_secs + 0.5 } else { timeout_secs };

@@ -7,7 +7,6 @@ from_address = "alertas@exemplo.com"
 encryption = "tls" # Options: "none", "tls", "ssl"
 
 [scan]
-ipv4_delay_ms = 10     # Delay between IPv4 sends (higher values avoid router ICMP rate-limit)
+ipv4_delay_ms = 1      # Delay between IPv4 sends in milliseconds (Default: 1ms. Increase to 5 or 10 if routers rate-limit ICMP/DDoS filter)
 ipv6_delay_us = 200    # Delay between IPv6 sends in microseconds
-timeout_secs = 2.0     # Time to wait for responses in each round (in seconds)
-
+timeout_secs = 1.0     # Time to wait for responses in each round in seconds (Default: 1.0. Increase to 2.0 if high network latency)
