@@ -94,6 +94,20 @@ loophunter check --name "Company"
 loophunter check --send-email
 ```
 
+### 4. SMTP Configuration
+
+To enable email alerts (`--send-email`), you must configure the `config.toml` file located in the execution directory (a default template is provided in the repository). Fill it with your SMTP provider details:
+
+```toml
+[smtp]
+host = "smtp.example.com"
+port = 587
+username = "alerts@example.com"
+password = "your_password_here"
+from_address = "alerts@example.com"
+encryption = "tls" # Options: "none", "tls", "ssl"
+```
+
 ---
 
 ## Sample Report
