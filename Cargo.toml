@@ -1,0 +1,17 @@
+[package]
+name = "loophunter"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4.4", features = ["derive"] }
+ipnetwork = "0.20"
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+chrono = "0.4"
+pnet_packet = "0.34"
+rand = "0.8"
+socket2 = "0.6"
