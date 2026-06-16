@@ -34,7 +34,7 @@ pub struct ScanConfig {
     pub ipv4_delay_ms: Option<u64>,
     /// Delay between IPv6 packet sends in microseconds.
     pub ipv6_delay_us: Option<u64>,
-    /// Timeout in seconds to wait for responses in each round.
+    /// Timeout in seconds to wait for responses after sending all requests.
     pub timeout_secs: Option<f64>,
 }
 
