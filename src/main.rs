@@ -84,14 +84,14 @@ enum ClientActions {
 /// Available actions for network prefix management.
 #[derive(Subcommand)]
 enum PrefixActions {
-    /// Associate a CIDR prefix (IPv4/IPv6) with a client: `prefix add --name <name> --prefix <prefix>`
+    /// Associate a CIDR prefix (IPv4/IPv6) with a client: `prefix add --name <name> --prefix <prefix> --asn <asn>`
     Add {
         #[arg(long)]
         name: String,
         #[arg(long)]
         prefix: String,
         #[arg(long)]
-        asn: Option<String>,
+        asn: String,
     },
     /// Remove a prefix: `prefix remove --prefix <prefix>`
     Remove {
@@ -215,23 +215,14 @@ async fn main() {
                     }
                 }
 
-                let validated_asn = if let Some(ref a) = asn {
-                    if !a.chars().all(|c| c.is_ascii_digit()) {
-                        eprintln!("Error: ASN must contain only numbers (digits) and no prefix. Got '{}'", a);
-                        process::exit(1);
-                    }
-                    Some(a.clone())
-                } else {
-                    None
-                };
+                if !asn.chars().all(|c| c.is_ascii_digit()) {
+                    eprintln!("Error: ASN must contain only numbers (digits) and no prefix. Got '{}'", asn);
+                    process::exit(1);
+                }
 
-                match db::add_prefix(&conn, &name, &prefix, validated_asn.as_deref()) {
+                match db::add_prefix(&conn, &name, &prefix, Some(&asn)) {
                     Ok(_) => {
-                        if let Some(ref a) = validated_asn {
-                            println!("Prefix '{}' (AS{}) added to client '{}'.", prefix, a, name);
-                        } else {
-                            println!("Prefix '{}' added to client '{}'.", prefix, name);
-                        }
+                        println!("Prefix '{}' (AS{}) added to client '{}'.", prefix, asn, name);
                     }
                     Err(e) => {
                         eprintln!("Error adding prefix: {}", e);
@@ -590,6 +581,7 @@ async fn main() {
                     }
                 }
 
+                println!();
                 println!("{}", console_report);
 
                 // Dispatch email if configured and loops are active or status has changed
