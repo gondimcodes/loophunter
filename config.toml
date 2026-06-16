@@ -5,3 +5,9 @@ username = "alertas@exemplo.com"
 password = "sua_senha_aqui"
 from_address = "alertas@exemplo.com"
 encryption = "tls" # Options: "none", "tls", "ssl"
+
+[scan]
+ipv4_delay_ms = 10     # Delay between IPv4 sends (higher values avoid router ICMP rate-limit)
+ipv6_delay_us = 200    # Delay between IPv6 sends in microseconds
+timeout_secs = 2.0     # Time to wait for responses in each round (in seconds)
+

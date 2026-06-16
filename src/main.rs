@@ -276,17 +276,33 @@ async fn main() {
             }
         },
         Commands::Check { name, send_email } => {
-            // Load email configuration if send_email is active
+            // Always try to load config.toml to extract custom scan settings or SMTP credentials
+            let config_loaded = notifier::load_config("config.toml").ok();
+
             let smtp_config = if send_email {
-                match notifier::load_config("config.toml") {
-                    Ok(cfg) => Some(cfg.smtp),
-                    Err(e) => {
-                        eprintln!("Error loading config.toml: {}", e);
-                        process::exit(1);
-                    }
+                if let Some(ref cfg) = config_loaded {
+                    Some(cfg.smtp.clone())
+                } else {
+                    eprintln!("Error: config.toml must be present and valid when --send-email is active.");
+                    process::exit(1);
                 }
             } else {
                 None
+            };
+
+            // Extract custom scan parameters or fall back to safe defaults
+            let (ipv4_delay_ms, ipv6_delay_us, timeout_secs) = if let Some(ref cfg) = config_loaded {
+                if let Some(ref scan) = cfg.scan {
+                    (
+                        scan.ipv4_delay_ms.unwrap_or(10),
+                        scan.ipv6_delay_us.unwrap_or(200),
+                        scan.timeout_secs.unwrap_or(2.0),
+                    )
+                } else {
+                    (10, 200, 2.0)
+                }
+            } else {
+                (10, 200, 2.0)
             };
 
             // Determine which clients will be scanned
@@ -355,7 +371,12 @@ async fn main() {
                 let prefix_strings: Vec<String> = prefixes.iter().map(|p| p.prefix.clone()).collect();
 
                 // Run asynchronous checks and capture results
-                let results = match checker::check_prefixes(&prefix_strings).await {
+                let results = match checker::check_prefixes(
+                    &prefix_strings,
+                    ipv4_delay_ms,
+                    ipv6_delay_us,
+                    timeout_secs,
+                ).await {
                     Ok(res) => res,
                     Err(e) => {
                         eprintln!("Error running checker: {}", e);

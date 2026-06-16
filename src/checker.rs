@@ -100,7 +100,12 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
 }
 
 /// Performs the complete scan by sending raw ICMP packets and parsing responses.
-pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, String> {
+pub async fn check_prefixes(
+    prefixes: &[String],
+    ipv4_delay_ms: u64,
+    ipv6_delay_us: u64,
+    timeout_secs: f64,
+) -> Result<Vec<LoopResult>, String> {
     let pid = std::process::id();
     let pid_high = ((pid >> 8) & 0xff) as u8;
     let pid_low = (pid & 0xff) as u8;
@@ -344,14 +349,14 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
             }
             // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
             let delay = match target_ip {
-                IpAddr::V4(_) => Duration::from_millis(1),
-                IpAddr::V6(_) => Duration::from_micros(200),
+                IpAddr::V4(_) => Duration::from_millis(ipv4_delay_ms),
+                IpAddr::V6(_) => Duration::from_micros(ipv6_delay_us),
             };
             thread::sleep(delay);
         }
 
         // Wait for responses in this round (last round waits a bit longer)
-        let wait_secs = if round == 3 { 2.0 } else { 1.5 };
+        let wait_secs = if round == 3 { timeout_secs + 0.5 } else { timeout_secs };
         tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
 
         // Update remaining targets (remove ones that responded in any way)
