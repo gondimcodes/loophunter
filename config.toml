@@ -1,0 +1,7 @@
+[smtp]
+host = "smtp.exemplo.com"
+port = 587
+username = "alertas@exemplo.com"
+password = "sua_senha_aqui"
+from_address = "alertas@exemplo.com"
+encryption = "tls" # Options: "none", "tls", "ssl"
