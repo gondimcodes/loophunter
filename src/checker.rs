@@ -111,9 +111,11 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
     socket_v4.set_read_timeout(Some(Duration::from_millis(100))).ok();
     socket_v6.set_read_timeout(Some(Duration::from_millis(100))).ok();
 
-    // Increase the receive buffer size to prevent packet loss under heavy load
-    socket_v4.set_recv_buffer_size(2 * 1024 * 1024).ok();
-    socket_v6.set_recv_buffer_size(2 * 1024 * 1024).ok();
+    // Increase the send/receive buffer sizes to prevent packet loss under heavy load
+    socket_v4.set_recv_buffer_size(4 * 1024 * 1024).ok();
+    socket_v6.set_recv_buffer_size(4 * 1024 * 1024).ok();
+    socket_v4.set_send_buffer_size(4 * 1024 * 1024).ok();
+    socket_v6.set_send_buffer_size(4 * 1024 * 1024).ok();
 
     // Map of detected loop IPs: target_ip -> router_ip
     let detected_loops = Arc::new(Mutex::new(HashMap::<IpAddr, IpAddr>::new()));
@@ -187,11 +189,13 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
                             if sz >= orig_ip_start + 20 {
                                 let orig_ihl = ((initialized_buf[orig_ip_start] & 0x0f) * 4) as usize;
                                 if sz >= orig_ip_start + orig_ihl + 6 {
+                                    let orig_proto = initialized_buf[orig_ip_start + 9];
+                                    let orig_type = initialized_buf[orig_ip_start + orig_ihl];
+                                    let id_high = initialized_buf[orig_ip_start + orig_ihl + 4];
+                                    let id_low = initialized_buf[orig_ip_start + orig_ihl + 5];
                                     // Verify original protocol is ICMPv4 (1) and type is Echo Request (8)
-                                    if initialized_buf[orig_ip_start + 9] == 1 && initialized_buf[orig_ip_start + orig_ihl] == 8 {
+                                    if orig_proto == 1 && orig_type == 8 {
                                         // Verify if the ping identifier matches our process PID
-                                        let id_high = initialized_buf[orig_ip_start + orig_ihl + 4];
-                                        let id_low = initialized_buf[orig_ip_start + orig_ihl + 5];
                                         if id_high == pid_high && id_low == pid_low {
                                             let router_ip = Ipv4Addr::new(initialized_buf[12], initialized_buf[13], initialized_buf[14], initialized_buf[15]);
                                             let target_ip = Ipv4Addr::new(
@@ -257,34 +261,54 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
     for &target_ip in ip_to_prefixes.keys() {
         match target_ip {
             IpAddr::V4(addr) => {
-                let mut packet = [0u8; 8];
+                let mut packet = [0u8; 64];
                 packet[0] = 8;  // Type: Echo Request
                 packet[1] = 0;  // Code: 0
                 // Checksum at packet[2..4]
                 packet[4] = pid_high; // Identifier High (from PID)
                 packet[5] = pid_low;  // Identifier Low (from PID)
+                for i in 8..64 {
+                    packet[i] = i as u8;
+                }
                 let checksum = calc_checksum(&packet);
                 packet[2] = (checksum >> 8) as u8;
                 packet[3] = (checksum & 0xff) as u8;
 
                 let dest = SocketAddr::new(IpAddr::V4(addr), 0);
-                let _ = socket_v4.send_to(&packet, &dest.into());
+                let mut retries = 0;
+                while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
+                    if retries >= 10 {
+                        break;
+                    }
+                    retries += 1;
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
             IpAddr::V6(addr) => {
-                let mut packet = [0u8; 8];
+                let mut packet = [0u8; 64];
                 packet[0] = 128; // Type: Echo Request (ICMPv6)
                 packet[1] = 0;   // Code: 0
                 // Checksum at packet[2..4] (written by OS)
                 packet[4] = pid_high;  // Identifier High (from PID)
                 packet[5] = pid_low;   // Identifier Low (from PID)
+                for i in 8..64 {
+                    packet[i] = i as u8;
+                }
 
                 let dest = SocketAddr::new(IpAddr::V6(addr), 0);
-                let _ = socket_v6.send_to(&packet, &dest.into());
+                let mut retries = 0;
+                while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
+                    if retries >= 10 {
+                        break;
+                    }
+                    retries += 1;
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
         // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
         let delay = match target_ip {
-            IpAddr::V4(_) => Duration::from_micros(500),
+            IpAddr::V4(_) => Duration::from_millis(1),
             IpAddr::V6(_) => Duration::from_micros(200),
         };
         thread::sleep(delay);
