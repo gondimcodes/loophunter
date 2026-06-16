@@ -101,6 +101,10 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
 
 /// Performs the complete scan by sending raw ICMP packets and parsing responses.
 pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, String> {
+    let pid = std::process::id();
+    let pid_high = ((pid >> 8) & 0xff) as u8;
+    let pid_low = (pid & 0xff) as u8;
+
     // Creation of raw sockets using socket2
     let socket_v4 = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
         .map_err(|e| format!("Failed to create IPv4 raw socket (Run as root/sudo): {}", e))?;
@@ -168,9 +172,8 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
     let running = Arc::new(Mutex::new(true));
     let running_clone = running.clone();
 
-    let pid = std::process::id();
-    let pid_high = ((pid >> 8) & 0xff) as u8;
-    let pid_low = (pid & 0xff) as u8;
+    let ip_to_prefixes_rx = Arc::new(ip_to_prefixes.clone());
+    let ip_to_prefixes_rx2 = ip_to_prefixes_rx.clone();
 
     // Spawn thread to listen for and process ICMPv4 packets
     thread::spawn(move || {
@@ -187,25 +190,19 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
                         if icmp_type == 11 { // Time Exceeded
                             let orig_ip_start = ihl + 8;
                             if sz >= orig_ip_start + 20 {
-                                let orig_ihl = ((initialized_buf[orig_ip_start] & 0x0f) * 4) as usize;
-                                if sz >= orig_ip_start + orig_ihl + 6 {
-                                    let orig_proto = initialized_buf[orig_ip_start + 9];
-                                    let orig_type = initialized_buf[orig_ip_start + orig_ihl];
-                                    let id_high = initialized_buf[orig_ip_start + orig_ihl + 4];
-                                    let id_low = initialized_buf[orig_ip_start + orig_ihl + 5];
-                                    // Verify original protocol is ICMPv4 (1) and type is Echo Request (8)
-                                    if orig_proto == 1 && orig_type == 8 {
-                                        // Verify if the ping identifier matches our process PID
-                                        if id_high == pid_high && id_low == pid_low {
-                                            let router_ip = Ipv4Addr::new(initialized_buf[12], initialized_buf[13], initialized_buf[14], initialized_buf[15]);
-                                            let target_ip = Ipv4Addr::new(
-                                                initialized_buf[orig_ip_start + 16],
-                                                initialized_buf[orig_ip_start + 17],
-                                                initialized_buf[orig_ip_start + 18],
-                                                initialized_buf[orig_ip_start + 19],
-                                            );
-                                            detected_loops_clone.lock().unwrap().insert(IpAddr::V4(target_ip), IpAddr::V4(router_ip));
-                                        }
+                                let orig_proto = initialized_buf[orig_ip_start + 9];
+                                // Verify original protocol is ICMPv4 (1)
+                                if orig_proto == 1 {
+                                    let target_ip = Ipv4Addr::new(
+                                        initialized_buf[orig_ip_start + 16],
+                                        initialized_buf[orig_ip_start + 17],
+                                        initialized_buf[orig_ip_start + 18],
+                                        initialized_buf[orig_ip_start + 19],
+                                    );
+                                    let ip_addr = IpAddr::V4(target_ip);
+                                    if ip_to_prefixes_rx.contains_key(&ip_addr) {
+                                        let router_ip = Ipv4Addr::new(initialized_buf[12], initialized_buf[13], initialized_buf[14], initialized_buf[15]);
+                                        detected_loops_clone.lock().unwrap().insert(ip_addr, IpAddr::V4(router_ip));
                                     }
                                 }
                             }
@@ -231,21 +228,18 @@ pub async fn check_prefixes(prefixes: &[String]) -> Result<Vec<LoopResult>, Stri
                     let icmpv6_type = initialized_buf[0];
                     if icmpv6_type == 3 { // Time Exceeded (Hop Limit Exceeded)
                         // The original IPv6 header starts at buf[8] (8 bytes of ICMPv6 header)
-                        // The original ICMPv6 Echo Request starts at 8 + 40 = 48.
-                        if sz >= 48 + 6 {
-                            // Verify original Next Header is ICMPv6 (58) and type is Echo Request (128)
-                            if initialized_buf[14] == 58 && initialized_buf[48] == 128 {
-                                // Verify if the ping identifier matches our process PID
-                                let id_high = initialized_buf[48 + 4];
-                                let id_low = initialized_buf[48 + 5];
-                                if id_high == pid_high && id_low == pid_low {
-                                    let mut ip_bytes = [0u8; 16];
-                                    ip_bytes.copy_from_slice(&initialized_buf[32..48]);
-                                    let target_ip = Ipv6Addr::from(ip_bytes);
-                                    
+                        // The destination IP starts at offset 8 + 24 = 32.
+                        if sz >= 48 {
+                            let orig_next_header = initialized_buf[14];
+                            if orig_next_header == 58 { // ICMPv6
+                                let mut ip_bytes = [0u8; 16];
+                                ip_bytes.copy_from_slice(&initialized_buf[32..48]);
+                                let target_ip = Ipv6Addr::from(ip_bytes);
+                                let ip_addr = IpAddr::V6(target_ip);
+                                if ip_to_prefixes_rx2.contains_key(&ip_addr) {
                                     if let Some(socket_addr) = addr.as_socket() {
                                         if let IpAddr::V6(router_ip) = socket_addr.ip() {
-                                            detected_loops_clone2.lock().unwrap().insert(IpAddr::V6(target_ip), IpAddr::V6(router_ip));
+                                            detected_loops_clone2.lock().unwrap().insert(ip_addr, IpAddr::V6(router_ip));
                                         }
                                     }
                                 }
