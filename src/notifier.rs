@@ -27,10 +27,22 @@ pub struct SmtpConfig {
     pub encryption: Option<String>,
 }
 
+/// Scan configuration settings.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScanConfig {
+    /// Delay between IPv4 packet sends in milliseconds.
+    pub ipv4_delay_ms: Option<u64>,
+    /// Delay between IPv6 packet sends in microseconds.
+    pub ipv6_delay_us: Option<u64>,
+    /// Timeout in seconds to wait for responses in each round.
+    pub timeout_secs: Option<f64>,
+}
+
 /// Maps the entire TOML configuration document.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub smtp: SmtpConfig,
+    pub scan: Option<ScanConfig>,
 }
 
 /// Represents an attachment to be sent along with the email.
