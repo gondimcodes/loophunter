@@ -59,14 +59,12 @@ After doing this, any system user will be able to run routing loop scans directl
 ./target/release/loophunter check
 ```
 
----
+## SMTP & Scan Configuration
 
-## SMTP Server Configuration
-
-To enable email notifications for routing loops:
+To enable email notifications and customize scanning parameters:
 
 1. Create a file named `config.toml` in the same directory as the executable (or in the root folder where you run the command).
-2. Configure it with your email provider's parameters following this template:
+2. Configure it with your SMTP credentials and scanning configurations following this template:
 
 ```toml
 [smtp]
@@ -76,4 +74,14 @@ username = "alerts@example.com"
 password = "your_password_here"
 from_address = "alerts@example.com"
 encryption = "tls" # Options: "none", "tls", "ssl"
+
+[scan]
+ipv4_delay_ms = 1      # Delay between IPv4 sends in milliseconds (Default: 1ms)
+ipv6_delay_us = 200    # Delay between IPv6 sends in microseconds (Default: 200us)
+timeout_secs = 1.0     # Time to wait for responses in seconds (Default: 1.0s)
+```
+
+3. **Security Warning:** Since `config.toml` contains plain-text SMTP credentials, you should restrict access to it using `chmod 600` to ensure only the owner can read or write it:
+```bash
+chmod 600 config.toml
 ```
