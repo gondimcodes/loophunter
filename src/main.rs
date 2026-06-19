@@ -282,18 +282,20 @@ async fn main() {
             };
 
             // Extract custom scan parameters or fall back to safe defaults
-            let (ipv4_delay_ms, ipv6_delay_us, timeout_secs) = if let Some(ref cfg) = config_loaded {
+            let (ipv4_delay_ms, ipv6_delay_us, timeout_secs, rounds, round_delay_ms) = if let Some(ref cfg) = config_loaded {
                 if let Some(ref scan) = cfg.scan {
                     (
                         scan.ipv4_delay_ms.unwrap_or(10),
                         scan.ipv6_delay_us.unwrap_or(200),
                         scan.timeout_secs.unwrap_or(2.0),
+                        scan.rounds.unwrap_or(3),
+                        scan.round_delay_ms.unwrap_or(1000),
                     )
                 } else {
-                    (10, 200, 2.0)
+                    (10, 200, 2.0, 3, 1000)
                 }
             } else {
-                (10, 200, 2.0)
+                (10, 200, 2.0, 3, 1000)
             };
 
             // Determine which clients will be scanned
@@ -367,6 +369,8 @@ async fn main() {
                     ipv4_delay_ms,
                     ipv6_delay_us,
                     timeout_secs,
+                    rounds,
+                    round_delay_ms,
                 ).await {
                     Ok(res) => res,
                     Err(e) => {

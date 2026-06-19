@@ -105,6 +105,8 @@ pub async fn check_prefixes(
     ipv4_delay_ms: u64,
     ipv6_delay_us: u64,
     timeout_secs: f64,
+    rounds: u32,
+    round_delay_ms: u64,
 ) -> Result<Vec<LoopResult>, String> {
     let pid = std::process::id();
     let pid_high = ((pid >> 8) & 0xff) as u8;
@@ -258,79 +260,86 @@ pub async fn check_prefixes(
 
     let targets: std::collections::BTreeSet<IpAddr> = ip_to_prefixes.keys().cloned().collect();
     let total_targets = targets.len();
+    let total_sends = total_targets * (rounds as usize);
     let mut sent_count = 0;
-    println!("Scanning {} targets...", total_targets);
+    println!("Scanning {} targets ({} rounds)...", total_targets, rounds);
 
     // Send ICMP Echo Request packets (Ping) to targets
-    for &target_ip in &targets {
-        match target_ip {
-            IpAddr::V4(addr) => {
-                let mut packet = [0u8; 64];
-                packet[0] = 8;  // Type: Echo Request
-                packet[1] = 0;  // Code: 0
-                // Checksum at packet[2..4]
-                packet[4] = pid_high; // Identifier High (from PID)
-                packet[5] = pid_low;  // Identifier Low (from PID)
-                for i in 8..64 {
-                    packet[i] = i as u8;
-                }
-                let checksum = calc_checksum(&packet);
-                packet[2] = (checksum >> 8) as u8;
-                packet[3] = (checksum & 0xff) as u8;
-
-                let dest = SocketAddr::new(IpAddr::V4(addr), 0);
-                let mut retries = 0;
-                while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
-                    if retries >= 10 {
-                        break;
-                    }
-                    retries += 1;
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            IpAddr::V6(addr) => {
-                let mut packet = [0u8; 64];
-                packet[0] = 128; // Type: Echo Request (ICMPv6)
-                packet[1] = 0;   // Code: 0
-                // Checksum at packet[2..4] (written by OS)
-                packet[4] = pid_high;  // Identifier High (from PID)
-                packet[5] = pid_low;   // Identifier Low (from PID)
-                for i in 8..64 {
-                    packet[i] = i as u8;
-                }
-
-                let dest = SocketAddr::new(IpAddr::V6(addr), 0);
-                let mut retries = 0;
-                while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
-                    if retries >= 10 {
-                        break;
-                    }
-                    retries += 1;
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
+    for round in 1..=rounds {
+        if round > 1 && round_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(round_delay_ms)).await;
         }
-        sent_count += 1;
-        if sent_count % 100 == 0 || sent_count == total_targets {
-            let percent = (sent_count * 100) / total_targets;
-            print!("\rProgress: {}% [", percent);
-            let filled = percent / 5;
-            for _ in 0..filled {
-                print!("=");
+
+        for &target_ip in &targets {
+            match target_ip {
+                IpAddr::V4(addr) => {
+                    let mut packet = [0u8; 64];
+                    packet[0] = 8;  // Type: Echo Request
+                    packet[1] = 0;  // Code: 0
+                    // Checksum at packet[2..4]
+                    packet[4] = pid_high; // Identifier High (from PID)
+                    packet[5] = pid_low;  // Identifier Low (from PID)
+                    for i in 8..64 {
+                        packet[i] = i as u8;
+                    }
+                    let checksum = calc_checksum(&packet);
+                    packet[2] = (checksum >> 8) as u8;
+                    packet[3] = (checksum & 0xff) as u8;
+
+                    let dest = SocketAddr::new(IpAddr::V4(addr), 0);
+                    let mut retries = 0;
+                    while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
+                        if retries >= 10 {
+                            break;
+                        }
+                        retries += 1;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                IpAddr::V6(addr) => {
+                    let mut packet = [0u8; 64];
+                    packet[0] = 128; // Type: Echo Request (ICMPv6)
+                    packet[1] = 0;   // Code: 0
+                    // Checksum at packet[2..4] (written by OS)
+                    packet[4] = pid_high;  // Identifier High (from PID)
+                    packet[5] = pid_low;   // Identifier Low (from PID)
+                    for i in 8..64 {
+                        packet[i] = i as u8;
+                    }
+
+                    let dest = SocketAddr::new(IpAddr::V6(addr), 0);
+                    let mut retries = 0;
+                    while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
+                        if retries >= 10 {
+                            break;
+                        }
+                        retries += 1;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
             }
-            for _ in filled..20 {
-                print!(" ");
+            sent_count += 1;
+            if sent_count % 100 == 0 || sent_count == total_sends {
+                let percent = (sent_count * 100) / total_sends;
+                print!("\rProgress: {}% [", percent);
+                let filled = percent / 5;
+                for _ in 0..filled {
+                    print!("=");
+                }
+                for _ in filled..20 {
+                    print!(" ");
+                }
+                print!("] ({}/{})", sent_count, total_sends);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
             }
-            print!("] ({}/{})", sent_count, total_targets);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+            // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
+            let delay = match target_ip {
+                IpAddr::V4(_) => Duration::from_millis(ipv4_delay_ms),
+                IpAddr::V6(_) => Duration::from_micros(ipv6_delay_us),
+            };
+            thread::sleep(delay);
         }
-        // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
-        let delay = match target_ip {
-            IpAddr::V4(_) => Duration::from_millis(ipv4_delay_ms),
-            IpAddr::V6(_) => Duration::from_micros(ipv6_delay_us),
-        };
-        thread::sleep(delay);
     }
     println!();
 

@@ -36,6 +36,10 @@ pub struct ScanConfig {
     pub ipv6_delay_us: Option<u64>,
     /// Timeout in seconds to wait for responses after sending all requests.
     pub timeout_secs: Option<f64>,
+    /// Number of packet transmission rounds.
+    pub rounds: Option<u32>,
+    /// Delay between rounds in milliseconds.
+    pub round_delay_ms: Option<u64>,
 }
 
 /// Maps the entire TOML configuration document.

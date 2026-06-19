@@ -10,3 +10,5 @@ encryption = "tls" # Options: "none", "tls", "ssl"
 ipv4_delay_ms = 1      # Delay between IPv4 sends in milliseconds (Default: 1ms. Increase to 5 or 10 if routers rate-limit ICMP/DDoS filter)
 ipv6_delay_us = 200    # Delay between IPv6 sends in microseconds
 timeout_secs = 1.0     # Time to wait for responses in seconds (Default: 1.0. Increase to 2.0 if high network latency)
+rounds = 3             # Number of packet transmission rounds to avoid false negatives on dropped packets (Default: 3)
+round_delay_ms = 1000  # Delay between transmission rounds in milliseconds (Default: 1000ms)
