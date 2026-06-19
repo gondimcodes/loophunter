@@ -64,26 +64,37 @@ pub fn load_config(path: &str) -> Result<AppConfig, String> {
     Ok(config)
 }
 
-/// Sends an email containing the routing loops report, optionally with attachments.
-pub fn send_email(
-    config: &SmtpConfig,
+fn build_message(
+    from_address: &str,
     to_email: &str,
     subject: &str,
     body: &str,
     attachments: &[EmailAttachment],
-) -> Result<(), String> {
+) -> Result<Message, String> {
     // Basic email construction
-    let builder = Message::builder()
+    let mut builder = Message::builder()
         .from(
-            config
-                .from_address
+            from_address
                 .parse()
                 .map_err(|e| format!("Invalid from address: {}", e))?,
-        )
-        .to(to_email
-            .parse()
-            .map_err(|e| format!("Invalid to address: {}", e))?)
-        .subject(subject);
+        );
+
+    let mut has_recipients = false;
+    for addr in to_email.split(|c| c == ',' || c == ';') {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            builder = builder.to(trimmed
+                .parse()
+                .map_err(|e| format!("Invalid to address '{}': {}", trimmed, e))?);
+            has_recipients = true;
+        }
+    }
+
+    if !has_recipients {
+        return Err("No valid recipients provided".to_string());
+    }
+
+    let builder = builder.subject(subject);
 
     // Builds the message with or without attachments
     let email = if attachments.is_empty() {
@@ -106,6 +117,19 @@ pub fn send_email(
             .map_err(|e| format!("Failed to build email: {}", e))?
     };
 
+    Ok(email)
+}
+
+/// Sends an email containing the routing loops report, optionally with attachments.
+pub fn send_email(
+    config: &SmtpConfig,
+    to_email: &str,
+    subject: &str,
+    body: &str,
+    attachments: &[EmailAttachment],
+) -> Result<(), String> {
+    let email = build_message(&config.from_address, to_email, subject, body, attachments)?;
+
     // Determines transport based on the specified port or encryption string
     let mut builder = if config.port == 465 || config.encryption.as_deref() == Some("ssl") {
         SmtpTransport::relay(&config.host).map_err(|e| e.to_string())?
@@ -125,4 +149,43 @@ pub fn send_email(
     transport.send(&email).map_err(|e| format!("Failed to send email: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_message_multiple_emails() {
+        let from = "alerts@example.com";
+        let to = "user1@example.com, user2@example.com; user3@example.com";
+        let subject = "Test Subject";
+        let body = "Test Body";
+        let attachments = vec![];
+
+        let msg = build_message(from, to, subject, body, &attachments).unwrap();
+
+        // Check envelope from address
+        assert_eq!(msg.envelope().from().map(|addr| addr.to_string()), Some("alerts@example.com".to_string()));
+
+        // Check envelope to addresses
+        let to_envelopes: Vec<String> = msg.envelope().to().iter().map(|addr| addr.to_string()).collect();
+        assert_eq!(to_envelopes.len(), 3);
+        assert!(to_envelopes.contains(&"user1@example.com".to_string()));
+        assert!(to_envelopes.contains(&"user2@example.com".to_string()));
+        assert!(to_envelopes.contains(&"user3@example.com".to_string()));
+    }
+
+    #[test]
+    fn test_build_message_no_recipients() {
+        let from = "alerts@example.com";
+        let to = "   , ;;   ";
+        let subject = "Test Subject";
+        let body = "Test Body";
+        let attachments = vec![];
+
+        let res = build_message(from, to, subject, body, &attachments);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "No valid recipients provided");
+    }
 }
