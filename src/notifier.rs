@@ -10,6 +10,44 @@ use lettre::message::header::ContentType;
 use serde::Deserialize;
 use std::fs;
 
+/// Validates a comma/semicolon-separated list of email addresses (SEC-5).
+/// Uses `lettre`'s own parser — the same one used at send time — so validation is exact.
+pub fn validate_email_list(email_str: &str) -> Result<(), String> {
+    use lettre::message::Mailbox;
+    let mut has_valid = false;
+    for addr in email_str.split(|c| c == ',' || c == ';') {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            trimmed
+                .parse::<Mailbox>()
+                .map_err(|_| format!("Invalid email address: '{}'", trimmed))?;
+            has_valid = true;
+        }
+    }
+    if !has_valid {
+        return Err("At least one valid email address is required".to_string());
+    }
+    Ok(())
+}
+
+/// SEC-4: Verifies that the config file is not readable by group or others.
+/// Fails fast with a clear error message if permissions are too broad.
+#[cfg(unix)]
+fn check_config_permissions(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("Cannot read metadata for '{}': {}", path, e))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "Security: '{}' has world/group-readable permissions ({:04o}). \
+             Fix with: chmod 600 {}",
+            path, mode & 0o777, path
+        ));
+    }
+    Ok(())
+}
+
 /// SMTP configuration for sending reports.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SmtpConfig {
@@ -56,7 +94,11 @@ pub struct EmailAttachment {
 }
 
 /// Loads and deserializes the `config.toml` file containing SMTP credentials.
+/// On Unix, also enforces that the file is not world/group readable (SEC-4).
 pub fn load_config(path: &str) -> Result<AppConfig, String> {
+    #[cfg(unix)]
+    check_config_permissions(path)?;
+
     let content = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read config file ({}): {}", path, e))?;
     let config: AppConfig = toml::from_str(&content)

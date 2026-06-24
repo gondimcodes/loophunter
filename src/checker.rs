@@ -1,18 +1,46 @@
 //! # Checker Engine Module (Custom Ping)
-//! 
+//!
 //! This module implements a native ping engine based on Linux raw sockets (via `socket2`).
-//! It sends ICMP/ICMPv6 Echo Request packets and listens to all responses. When an intermediate router
-//! sends a "Time Exceeded" packet (exceeded hop limit), the engine parses the nested packet inside the ICMP
-//! payload (which contains a copy of the original IP header) to recover the intended target IP address.
-//! This bypasses the limitations of high-level libraries that do not associate Time Exceeded messages from third-party IPs.
+//! It sends ICMP/ICMPv6 Echo Request packets and listens to all responses. When an intermediate
+//! router sends a "Time Exceeded" packet, the engine parses the nested original IP header inside
+//! the ICMP payload to recover the intended target IP address.
+//!
+//! This bypasses the limitations of high-level libraries that cannot associate Time Exceeded
+//! messages from third-party IPs back to the original probed destination.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
 use ipnetwork::{IpNetwork, Ipv6Network};
-use socket2::{Socket, Domain, Type, Protocol};
+use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
+use colored::Colorize;
+
+/// Renders the scan progress bar to stderr — identical style to the ampscan project.
+/// Uses unicode block characters and terminal colors for a clean, readable display.
+fn draw_progress(label: &str, done: usize, total: usize) {
+    use std::io::Write;
+    let width = 30usize;
+    let ratio = if total > 0 {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let percent = ratio * 100.0;
+    let filled = (ratio * width as f64).round() as usize;
+    let empty = width - filled;
+    let bar_filled = "█".repeat(filled).cyan();
+    let bar_empty = "░".repeat(empty).bright_black();
+    eprint!(
+        "\r  [{}] Progress: [{}{}] {:.1}% ({}/{})",
+        label, bar_filled, bar_empty, percent, done, total
+    );
+    let _ = std::io::stderr().flush();
+}
 
 /// Structure containing the results of scanning a specific target IP.
 #[derive(Debug, Clone)]
@@ -42,8 +70,8 @@ fn calc_checksum(data: &[u8]) -> u16 {
     !sum as u16
 }
 
-/// Helper to split an IPv6 prefix into representative subnets (e.g. breaking a /32 into /48s)
-/// and returning the first usable IP of each.
+/// Splits an IPv6 prefix into representative sub-blocks (e.g. /32 → /48s)
+/// and returns the first, middle, and last usable IP of each.
 fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
     let prefix_len = net_v6.prefix();
     let start_bits = u128::from(net_v6.network());
@@ -53,7 +81,7 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
     } else if prefix_len < 56 {
         56
     } else {
-        // For smaller blocks (prefix length >= 56), define targets according to the available space
+        // For smaller blocks (>= /56), define targets according to the available space
         let step = 128 - prefix_len;
         if step == 0 {
             return vec![IpAddr::V6(Ipv6Addr::from(start_bits))];
@@ -73,9 +101,9 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
 
     let step = 128 - target_sub_len; // 80 for /48, 72 for /56
     let num_subnets_shift = target_sub_len - prefix_len;
-    
+
     if num_subnets_shift > 16 {
-        // Prevent subnet explosion in memory, return targets only for the base block
+        // Prevent subnet explosion in memory; return only base-block targets
         return vec![
             IpAddr::V6(Ipv6Addr::from(start_bits + 1)),
             IpAddr::V6(Ipv6Addr::from(start_bits + (1u128 << (step - 1)))),
@@ -83,23 +111,29 @@ fn get_ipv6_delegated_targets(net_v6: &Ipv6Network) -> Vec<IpAddr> {
         ];
     }
 
-    let num_subnets = 1 << num_subnets_shift;
+    let num_subnets = 1usize << num_subnets_shift;
     let mut targets = Vec::with_capacity(num_subnets * 3);
 
     for i in 0..num_subnets {
         let subnet_bits = start_bits + ((i as u128) << step);
-        // Beginning (::1)
         targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + 1)));
-        // Middle
         targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + (1u128 << (step - 1)))));
-        // End
         targets.push(IpAddr::V6(Ipv6Addr::from(subnet_bits + (1u128 << step) - 1)));
     }
 
     targets
 }
 
-/// Performs the complete scan by sending raw ICMP packets and parsing responses.
+/// Performs the complete scan by sending raw ICMP packets and parsing ICMP error responses.
+///
+/// # Arguments
+/// * `prefixes`        - List of CIDR prefixes to scan.
+/// * `ipv4_delay_ms`   - Delay between IPv4 sends in milliseconds.
+/// * `ipv6_delay_us`   - Delay between IPv6 sends in microseconds.
+/// * `timeout_secs`    - Seconds to wait for responses after all packets are sent.
+/// * `rounds`          - Number of transmission rounds (to mitigate ARP/cold-route drops).
+/// * `round_delay_ms`  - Delay between rounds in milliseconds.
+/// * `label`           - Client identifier used in progress output (supports parallel scans).
 pub async fn check_prefixes(
     prefixes: &[String],
     ipv4_delay_ms: u64,
@@ -107,33 +141,41 @@ pub async fn check_prefixes(
     timeout_secs: f64,
     rounds: u32,
     round_delay_ms: u64,
+    label: &str,
 ) -> Result<Vec<LoopResult>, String> {
-    let pid = std::process::id();
-    let pid_high = ((pid >> 8) & 0xff) as u8;
-    let pid_low = (pid & 0xff) as u8;
+    // SEC-2: Random 16-bit session identifier per scan run.
+    // Using PID (previous approach) was predictable; a local attacker could inject
+    // spoofed Time Exceeded packets with the known identifier to produce false positives.
+    let session_id: u16 = rand::thread_rng().gen();
+    let id_high = (session_id >> 8) as u8;
+    let id_low = (session_id & 0xff) as u8;
 
-    // Creation of raw sockets using socket2
+    // Create raw sockets
     let socket_v4 = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
-        .map_err(|e| format!("Failed to create IPv4 raw socket (Run as root/sudo): {}", e))?;
+        .map_err(|e| format!("Failed to create IPv4 raw socket (needs cap_net_raw): {}", e))?;
     let socket_v6 = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6))
-        .map_err(|e| format!("Failed to create IPv6 raw socket (Run as root/sudo): {}", e))?;
+        .map_err(|e| format!("Failed to create IPv6 raw socket (needs cap_net_raw): {}", e))?;
 
-    // Configures non-blocking or short read timeouts on the sockets
-    socket_v4.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    socket_v6.set_read_timeout(Some(Duration::from_millis(100))).ok();
+    // Short timeout on recv so receiver threads can check the `running` flag regularly
+    socket_v4
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+    socket_v6
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
 
-    // Increase the send/receive buffer sizes to prevent packet loss under heavy load
+    // Enlarge OS kernel buffers to absorb bursts without dropping packets under heavy load
     socket_v4.set_recv_buffer_size(4 * 1024 * 1024).ok();
     socket_v6.set_recv_buffer_size(4 * 1024 * 1024).ok();
     socket_v4.set_send_buffer_size(4 * 1024 * 1024).ok();
     socket_v6.set_send_buffer_size(4 * 1024 * 1024).ok();
 
-    // Map of detected loop IPs: target_ip -> router_ip
+    // Shared map: target_ip → router_ip (populated by receiver threads)
     let detected_loops = Arc::new(Mutex::new(HashMap::<IpAddr, IpAddr>::new()));
 
-    // Expands the list of IPs to be tested and maps which IP belongs to which prefixes
-    let mut ip_to_prefixes: HashMap<IpAddr, Vec<String>> = HashMap::new();
-    let mut errors = Vec::new();
+    // Expand prefixes into individual target IPs and build the reverse map
+    let mut ip_to_prefixes_map: HashMap<IpAddr, Vec<String>> = HashMap::new();
+    let mut errors: Vec<LoopResult> = Vec::new();
 
     for prefix_str in prefixes {
         let net = match prefix_str.parse::<IpNetwork>() {
@@ -148,11 +190,10 @@ pub async fn check_prefixes(
                 continue;
             }
         };
-
         match net {
             IpNetwork::V4(net_v4) => {
                 for ip in net_v4.iter() {
-                    ip_to_prefixes
+                    ip_to_prefixes_map
                         .entry(IpAddr::V4(ip))
                         .or_default()
                         .push(prefix_str.clone());
@@ -160,7 +201,7 @@ pub async fn check_prefixes(
             }
             IpNetwork::V6(net_v6) => {
                 for ip in get_ipv6_delegated_targets(&net_v6) {
-                    ip_to_prefixes
+                    ip_to_prefixes_map
                         .entry(ip)
                         .or_default()
                         .push(prefix_str.clone());
@@ -169,102 +210,181 @@ pub async fn check_prefixes(
         }
     }
 
-    // Clone sockets for the packet receiving threads
+    // PERF-2: Wrap the map in Arc directly — no full clone needed.
+    // Both receiver threads and the final result loop share a single allocation.
+    let ip_to_prefixes = Arc::new(ip_to_prefixes_map);
+
+    // Clone sockets for the receiver threads (socket2::Socket is Send + Sync on Unix)
     let rx_socket_v4 = socket_v4.try_clone().map_err(|e| e.to_string())?;
     let rx_socket_v6 = socket_v6.try_clone().map_err(|e| e.to_string())?;
 
-    let detected_loops_clone = detected_loops.clone();
-
-    // Flag to stop the receiver threads after scanning
+    // Shared flag to signal receiver threads to exit after the scan is done
     let running = Arc::new(Mutex::new(true));
-    let running_clone = running.clone();
 
-    let ip_to_prefixes_rx = Arc::new(ip_to_prefixes.clone());
-    let ip_to_prefixes_rx2 = ip_to_prefixes_rx.clone();
+    // ── IPv4 Receiver Thread ──────────────────────────────────────────────────
+    {
+        let detected_loops = Arc::clone(&detected_loops);
+        let ip_to_prefixes = Arc::clone(&ip_to_prefixes);
+        let running = Arc::clone(&running);
 
-    // Spawn thread to listen for and process ICMPv4 packets
-    thread::spawn(move || {
-        let mut buf = [std::mem::MaybeUninit::new(0u8); 1024];
-        while *running_clone.lock().unwrap() {
-            if let Ok((sz, _)) = rx_socket_v4.recv_from(&mut buf) {
-                if sz >= 20 {
-                    // Safe cast since u8 and MaybeUninit<u8> share the same memory layout
-                    let initialized_buf = unsafe { &*(&buf[..sz] as *const [std::mem::MaybeUninit<u8>] as *const [u8]) };
-                    
-                    let ihl = ((initialized_buf[0] & 0x0f) * 4) as usize;
-                    if sz >= ihl + 8 {
-                        let icmp_type = initialized_buf[ihl];
-                        if icmp_type == 11 { // Time Exceeded
-                            let orig_ip_start = ihl + 8;
-                            if sz >= orig_ip_start + 20 {
-                                let orig_proto = initialized_buf[orig_ip_start + 9];
-                                // Verify original protocol is ICMPv4 (1)
-                                if orig_proto == 1 {
-                                    let target_ip = Ipv4Addr::new(
-                                        initialized_buf[orig_ip_start + 16],
-                                        initialized_buf[orig_ip_start + 17],
-                                        initialized_buf[orig_ip_start + 18],
-                                        initialized_buf[orig_ip_start + 19],
-                                    );
-                                    let ip_addr = IpAddr::V4(target_ip);
-                                    if ip_to_prefixes_rx.contains_key(&ip_addr) {
-                                        let router_ip = Ipv4Addr::new(initialized_buf[12], initialized_buf[13], initialized_buf[14], initialized_buf[15]);
-                                        detected_loops_clone.lock().unwrap().insert(ip_addr, IpAddr::V4(router_ip));
+        thread::spawn(move || {
+            // ROB-3: 4096-byte buffer handles oversized ICMP error packets
+            // (standard ICMP Time Exceeded can exceed 1024 bytes with IP options)
+            let mut buf = [MaybeUninit::new(0u8); 4096];
+
+            // ROB-1: Recover from mutex poisoning instead of panicking
+            while *running.lock().unwrap_or_else(|e| e.into_inner()) {
+                if let Ok((sz, _)) = rx_socket_v4.recv_from(&mut buf) {
+                    if sz < 20 {
+                        continue;
+                    }
+                    // SAFETY: `recv_from` guarantees that exactly `sz` bytes in `buf`
+                    // were initialised by the OS kernel before returning.
+                    let data =
+                        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, sz) };
+
+                    let ihl = ((data[0] & 0x0f) * 4) as usize;
+                    if sz < ihl + 8 {
+                        continue;
+                    }
+                    if data[ihl] != 11 {
+                        // Not ICMP Type 11 (Time Exceeded)
+                        continue;
+                    }
+
+                    let orig_ip_start = ihl + 8;
+                    if sz < orig_ip_start + 20 {
+                        continue;
+                    }
+                    if data[orig_ip_start + 9] != 1 {
+                        // Encapsulated protocol is not ICMPv4
+                        continue;
+                    }
+
+                    let target_ip = Ipv4Addr::new(
+                        data[orig_ip_start + 16],
+                        data[orig_ip_start + 17],
+                        data[orig_ip_start + 18],
+                        data[orig_ip_start + 19],
+                    );
+                    let ip_addr = IpAddr::V4(target_ip);
+
+                    if ip_to_prefixes.contains_key(&ip_addr) {
+                        let router_ip =
+                            Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+
+                        // Filter 1: router_ip must differ from target_ip.
+                        // When they are equal the target host itself sent the Time
+                        // Exceeded (hairpin route, misconfigured static route, etc.)
+                        // — that is NOT a routing loop between two distinct routers.
+                        if router_ip == target_ip {
+                            continue;
+                        }
+
+                        // Filter 2 (SEC-2): Verify the ICMP identifier embedded inside
+                        // the Time Exceeded payload matches our random session token.
+                        // Structure: outer_ihl + 8 (ICMP TE hdr) + orig_inner_ihl
+                        //            + 4 (ICMP echo hdr before id) = id_high / id_low.
+                        // Rejects stray Time Exceeded packets from other concurrent
+                        // scanners or unrelated ICMP traffic on the same raw socket.
+                        let orig_inner_ihl = ((data[orig_ip_start] & 0x0f) * 4) as usize;
+                        let orig_icmp_start = orig_ip_start + orig_inner_ihl;
+                        if sz >= orig_icmp_start + 6 {
+                            if data[orig_icmp_start + 4] != id_high
+                                || data[orig_icmp_start + 5] != id_low
+                            {
+                                continue; // Not our packet
+                            }
+                        }
+
+                        // ROB-1: Skip insert on poisoned mutex instead of panicking
+                        if let Ok(mut map) = detected_loops.lock() {
+                            map.insert(ip_addr, IpAddr::V4(router_ip));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // ── ICMPv6 Receiver Thread ────────────────────────────────────────────────
+    {
+        let detected_loops = Arc::clone(&detected_loops);
+        let ip_to_prefixes = Arc::clone(&ip_to_prefixes);
+        let running = Arc::clone(&running);
+
+        thread::spawn(move || {
+            let mut buf = [MaybeUninit::new(0u8); 4096];
+
+            while *running.lock().unwrap_or_else(|e| e.into_inner()) {
+                // ICMPv6 raw sockets on Linux omit the outer IPv6 header;
+                // the buffer starts directly at the ICMPv6 header.
+                if let Ok((sz, addr)) = rx_socket_v6.recv_from(&mut buf) {
+                    if sz < 8 {
+                        continue;
+                    }
+                    // SAFETY: `recv_from` guarantees that exactly `sz` bytes in `buf`
+                    // were initialised by the OS kernel before returning.
+                    let data =
+                        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, sz) };
+
+                    if data[0] != 3 {
+                        // Not ICMPv6 Type 3 (Time Exceeded / Hop Limit Exceeded)
+                        continue;
+                    }
+                    // Original IPv6 header starts at data[8]; dest IP at data[8 + 24] = data[32]
+                    if sz < 48 || data[14] != 58 {
+                        // Too short, or encapsulated next-header is not ICMPv6 (58)
+                        continue;
+                    }
+
+                    let mut ip_bytes = [0u8; 16];
+                    ip_bytes.copy_from_slice(&data[32..48]);
+                    let target_ip = Ipv6Addr::from(ip_bytes);
+                    let ip_addr = IpAddr::V6(target_ip);
+
+                    if ip_to_prefixes.contains_key(&ip_addr) {
+                        if let Some(socket_addr) = addr.as_socket() {
+                            if let IpAddr::V6(router_ip) = socket_addr.ip() {
+                                // Filter 1: router must differ from target
+                                if IpAddr::V6(router_ip) == ip_addr {
+                                    continue;
+                                }
+
+                                // Filter 2 (SEC-2): Verify ICMPv6 session identifier.
+                                // ICMPv6 raw socket buffer layout (no outer IPv6 hdr):
+                                //   data[0..8]  = ICMPv6 Time Exceeded header
+                                //   data[8..48] = original IPv6 header (fixed 40 bytes)
+                                //   data[48..]  = original ICMPv6 Echo Request
+                                //   data[52..54]= ICMP identifier (id_high, id_low)
+                                if sz >= 54 {
+                                    if data[52] != id_high || data[53] != id_low {
+                                        continue; // Not our packet
                                     }
+                                }
+
+                                if let Ok(mut map) = detected_loops.lock() {
+                                    map.insert(ip_addr, IpAddr::V6(router_ip));
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
-    let detected_loops_clone2 = detected_loops.clone();
-    let running_clone2 = running.clone();
-
-    // Spawn thread to listen for and process ICMPv6 packets
-    thread::spawn(move || {
-        let mut buf = [std::mem::MaybeUninit::new(0u8); 1024];
-        while *running_clone2.lock().unwrap() {
-            if let Ok((sz, addr)) = rx_socket_v6.recv_from(&mut buf) {
-                // ICMPv6 RAW sockets in Linux do not include the outer IPv6 header in the buffer.
-                // The buffer starts directly at the ICMPv6 header.
-                if sz >= 8 {
-                    let initialized_buf = unsafe { &*(&buf[..sz] as *const [std::mem::MaybeUninit<u8>] as *const [u8]) };
-                    let icmpv6_type = initialized_buf[0];
-                    if icmpv6_type == 3 { // Time Exceeded (Hop Limit Exceeded)
-                        // The original IPv6 header starts at buf[8] (8 bytes of ICMPv6 header)
-                        // The destination IP starts at offset 8 + 24 = 32.
-                        if sz >= 48 {
-                            let orig_next_header = initialized_buf[14];
-                            if orig_next_header == 58 { // ICMPv6
-                                let mut ip_bytes = [0u8; 16];
-                                ip_bytes.copy_from_slice(&initialized_buf[32..48]);
-                                let target_ip = Ipv6Addr::from(ip_bytes);
-                                let ip_addr = IpAddr::V6(target_ip);
-                                if ip_to_prefixes_rx2.contains_key(&ip_addr) {
-                                    if let Some(socket_addr) = addr.as_socket() {
-                                        if let IpAddr::V6(router_ip) = socket_addr.ip() {
-                                            detected_loops_clone2.lock().unwrap().insert(ip_addr, IpAddr::V6(router_ip));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
+    // ── Send Loop ─────────────────────────────────────────────────────────────
     let targets: std::collections::BTreeSet<IpAddr> = ip_to_prefixes.keys().cloned().collect();
     let total_targets = targets.len();
     let total_sends = total_targets * (rounds as usize);
-    let mut sent_count = 0;
-    println!("Scanning {} targets ({} rounds)...", total_targets, rounds);
+    let mut sent_count = 0usize;
 
-    // Send ICMP Echo Request packets (Ping) to targets
+    println!(
+        "[{}] Scanning {} targets ({} rounds)...",
+        label, total_targets, rounds
+    );
+
     for round in 1..=rounds {
         if round > 1 && round_delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(round_delay_ms)).await;
@@ -274,11 +394,10 @@ pub async fn check_prefixes(
             match target_ip {
                 IpAddr::V4(addr) => {
                     let mut packet = [0u8; 64];
-                    packet[0] = 8;  // Type: Echo Request
-                    packet[1] = 0;  // Code: 0
-                    // Checksum at packet[2..4]
-                    packet[4] = pid_high; // Identifier High (from PID)
-                    packet[5] = pid_low;  // Identifier Low (from PID)
+                    packet[0] = 8; // Echo Request
+                    packet[1] = 0;
+                    packet[4] = id_high;
+                    packet[5] = id_low;
                     for i in 8..64 {
                         packet[i] = i as u8;
                     }
@@ -287,78 +406,74 @@ pub async fn check_prefixes(
                     packet[3] = (checksum & 0xff) as u8;
 
                     let dest = SocketAddr::new(IpAddr::V4(addr), 0);
-                    let mut retries = 0;
-                    while let Err(_) = socket_v4.send_to(&packet, &dest.into()) {
-                        if retries >= 10 {
+                    // PERF-1: Use tokio::time::sleep for retries so other async tasks
+                    // can run during the brief backoff — thread::sleep would block the executor.
+                    for _ in 0..10 {
+                        if socket_v4.send_to(&packet, &dest.into()).is_ok() {
                             break;
                         }
-                        retries += 1;
-                        thread::sleep(Duration::from_millis(1));
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
                 IpAddr::V6(addr) => {
                     let mut packet = [0u8; 64];
-                    packet[0] = 128; // Type: Echo Request (ICMPv6)
-                    packet[1] = 0;   // Code: 0
-                    // Checksum at packet[2..4] (written by OS)
-                    packet[4] = pid_high;  // Identifier High (from PID)
-                    packet[5] = pid_low;   // Identifier Low (from PID)
+                    packet[0] = 128; // Echo Request (ICMPv6)
+                    packet[1] = 0;
+                    // Checksum at packet[2..4] is computed by the OS for ICMPv6
+                    packet[4] = id_high;
+                    packet[5] = id_low;
                     for i in 8..64 {
                         packet[i] = i as u8;
                     }
 
                     let dest = SocketAddr::new(IpAddr::V6(addr), 0);
-                    let mut retries = 0;
-                    while let Err(_) = socket_v6.send_to(&packet, &dest.into()) {
-                        if retries >= 10 {
+                    for _ in 0..10 {
+                        if socket_v6.send_to(&packet, &dest.into()).is_ok() {
                             break;
                         }
-                        retries += 1;
-                        thread::sleep(Duration::from_millis(1));
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
             }
+
             sent_count += 1;
-            if sent_count % 100 == 0 || sent_count == total_sends {
-                let percent = (sent_count * 100) / total_sends;
-                print!("\rProgress: {}% [", percent);
-                let filled = percent / 5;
-                for _ in 0..filled {
-                    print!("=");
-                }
-                for _ in filled..20 {
-                    print!(" ");
-                }
-                print!("] ({}/{})", sent_count, total_sends);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-            // Small delay between sends to avoid overloading the local buffer and router ICMP rate-limiting
+            draw_progress(label, sent_count, total_sends);
+
+            // PERF-1: Async sleep between packets — yields to other Tokio tasks
+            // (e.g. other clients scanning in parallel) during the inter-packet delay.
             let delay = match target_ip {
                 IpAddr::V4(_) => Duration::from_millis(ipv4_delay_ms),
                 IpAddr::V6(_) => Duration::from_micros(ipv6_delay_us),
             };
-            thread::sleep(delay);
+            tokio::time::sleep(delay).await;
         }
     }
-    println!();
+    eprintln!(); // Move to next line after progress bar
 
-    // Wait for responses
+    // Wait for all in-flight Time Exceeded responses to arrive
     tokio::time::sleep(Duration::from_secs_f64(timeout_secs)).await;
 
-    // Shutdown the receiving threads
-    *running.lock().unwrap() = false;
+    // Signal receiver threads to exit on their next loop iteration
+    if let Ok(mut flag) = running.lock() {
+        *flag = false;
+    }
+    // Wait for receiver threads to finish their current recv_from call (max 100ms timeout).
+    // Without this, a Time Exceeded packet that arrived just as we set running=false
+    // would be processed by the receiver thread AFTER we snapshot detected_loops, causing
+    // a false negative. The 150ms sleep covers the worst case of the 100ms recv timeout.
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Build final results matching loops with their respective prefixes
-    let loops_map = detected_loops.lock().unwrap();
+    // ── Build Results ─────────────────────────────────────────────────────────
+    let loops_map = detected_loops.lock().unwrap_or_else(|e| e.into_inner());
     let mut results = errors;
 
-    for (target_ip, prefixes_list) in ip_to_prefixes {
-        let router_ip = loops_map.get(&target_ip).cloned();
+    // PERF-2: Iterate via Arc reference — no HashMap clone needed
+    for (target_ip, prefixes_list) in ip_to_prefixes.iter() {
+        let router_ip = loops_map.get(target_ip).cloned();
         for prefix in prefixes_list {
             results.push(LoopResult {
-                prefix,
-                target_ip,
+                prefix: prefix.clone(),
+                target_ip: *target_ip,
                 router_ip,
                 error: None,
             });
