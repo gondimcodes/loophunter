@@ -243,7 +243,14 @@ pub async fn check_prefixes(
                     let data =
                         unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, sz) };
 
-                    let ihl = ((data[0] & 0x0f) * 4) as usize;
+                    // Sanity-check the outer IP header: must be IPv4 (version=4)
+                    // with a valid IHL (≥ 5 → ≥ 20 bytes). Raw sockets occasionally
+                    // deliver malformed frames that would produce garbage offsets.
+                    let outer_ihl_words = data[0] & 0x0f;
+                    if data[0] >> 4 != 4 || outer_ihl_words < 5 {
+                        continue;
+                    }
+                    let ihl = (outer_ihl_words * 4) as usize;
                     if sz < ihl + 8 {
                         continue;
                     }
@@ -281,20 +288,37 @@ pub async fn check_prefixes(
                             continue;
                         }
 
-                        // Filter 2 (SEC-2): Verify the ICMP identifier embedded inside
-                        // the Time Exceeded payload matches our random session token.
-                        // Structure: outer_ihl + 8 (ICMP TE hdr) + orig_inner_ihl
-                        //            + 4 (ICMP echo hdr before id) = id_high / id_low.
-                        // Rejects stray Time Exceeded packets from other concurrent
-                        // scanners or unrelated ICMP traffic on the same raw socket.
-                        let orig_inner_ihl = ((data[orig_ip_start] & 0x0f) * 4) as usize;
+                        // SEC-2 (FAIL-CLOSED): Verify the ICMP identifier inside
+                        // the Time Exceeded payload against our random session token.
+                        // Logic:
+                        //   outer_ihl + 8 (ICMP TE header)
+                        //   + orig_inner_ihl (inner IP header)
+                        //   + 4 bytes (type/code/checksum)
+                        //   = offset of ICMP identifier (id_high, id_low)
+                        // FAIL-CLOSED: if the packet is too short to contain the
+                        // full inner ICMP header, REJECT it instead of accepting
+                        // speculatively. This prevents truncated stray traffic from
+                        // bypassing the session check.
+                        // EMBEDDED TYPE: also confirm the embedded ICMP message is
+                        // an Echo Request (type 8) — guarantees this Time Exceeded
+                        // is a response to our probe and not to some other ICMP type.
+                        let orig_inner_ihl_words = data[orig_ip_start] & 0x0f;
+                        if orig_inner_ihl_words < 5 {
+                            continue; // Invalid inner IHL — reject
+                        }
+                        let orig_inner_ihl = (orig_inner_ihl_words * 4) as usize;
                         let orig_icmp_start = orig_ip_start + orig_inner_ihl;
-                        if sz >= orig_icmp_start + 6 {
-                            if data[orig_icmp_start + 4] != id_high
-                                || data[orig_icmp_start + 5] != id_low
-                            {
-                                continue; // Not our packet
-                            }
+                        // Need at least 6 bytes of the embedded ICMP: type(1)+code(1)+cksum(2)+id(2)
+                        if sz < orig_icmp_start + 6 {
+                            continue; // Too short to verify — REJECT (fail-closed)
+                        }
+                        if data[orig_icmp_start] != 8 {
+                            continue; // Embedded type is not Echo Request — not our probe
+                        }
+                        if data[orig_icmp_start + 4] != id_high
+                            || data[orig_icmp_start + 5] != id_low
+                        {
+                            continue; // Session ID mismatch — not our packet
                         }
 
                         // ROB-1: Skip insert on poisoned mutex instead of panicking
@@ -351,16 +375,29 @@ pub async fn check_prefixes(
                                     continue;
                                 }
 
-                                // Filter 2 (SEC-2): Verify ICMPv6 session identifier.
-                                // ICMPv6 raw socket buffer layout (no outer IPv6 hdr):
-                                //   data[0..8]  = ICMPv6 Time Exceeded header
-                                //   data[8..48] = original IPv6 header (fixed 40 bytes)
-                                //   data[48..]  = original ICMPv6 Echo Request
-                                //   data[52..54]= ICMP identifier (id_high, id_low)
-                                if sz >= 54 {
-                                    if data[52] != id_high || data[53] != id_low {
-                                        continue; // Not our packet
-                                    }
+                                // SEC-2 (FAIL-CLOSED): Verify the ICMPv6 session ID
+                                // and embedded message type.
+                                //
+                                // Buffer layout (Linux omits outer IPv6 header):
+                                //   data[0..8]   ICMPv6 Time Exceeded header
+                                //   data[8..48]  original IPv6 header (fixed 40 bytes)
+                                //   data[48]     original ICMPv6 type  (must be 128)
+                                //   data[49]     code
+                                //   data[50..52] checksum
+                                //   data[52]     id_high  ← session ID
+                                //   data[53]     id_low   ← session ID
+                                //   data[54..56] sequence
+                                //
+                                // FAIL-CLOSED: require at least 56 bytes so all
+                                // fields above are present before checking any of them.
+                                if sz < 56 {
+                                    continue; // Too short — REJECT
+                                }
+                                if data[48] != 128 {
+                                    continue; // Embedded type is not ICMPv6 Echo Request
+                                }
+                                if data[52] != id_high || data[53] != id_low {
+                                    continue; // Session ID mismatch — not our packet
                                 }
 
                                 if let Ok(mut map) = detected_loops.lock() {
