@@ -1,0 +1,76 @@
+name: CD (Automatic Release)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release for ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      matrix:
+        job:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: loophunter
+            asset_ext: tar.gz
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: loophunter.exe
+            asset_ext: zip
+          # macOS ARM64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: loophunter
+            asset_ext: tar.gz
+          # macOS x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: loophunter
+            asset_ext: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.job.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.job.target }}
+
+      - name: Package binary (Unix)
+        if: startsWith(matrix.job.os, 'ubuntu') || startsWith(matrix.job.os, 'macos')
+        run: |
+          cd target/${{ matrix.job.target }}/release
+          tar -czf ../../../loophunter-${{ github.ref_name }}-${{ matrix.job.target }}.${{ matrix.job.asset_ext }} ${{ matrix.job.binary_name }}
+          cd -
+
+      - name: Package binary (Windows)
+        if: matrix.job.os == 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.job.target }}/release
+          7z a ../../../loophunter-${{ github.ref_name }}-${{ matrix.job.target }}.${{ matrix.job.asset_ext }} ${{ matrix.job.binary_name }}
+          cd -
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            loophunter-${{ github.ref_name }}-*.tar.gz
+            loophunter-${{ github.ref_name }}-*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
