@@ -130,3 +130,12 @@ OLD SIDE                                                                        
 ```
 
 The `<` character indicates that the previous loop on IP `198.18.0.15` was resolved. The `>` character indicates that a new loop has emerged on IP `198.18.0.1`.
+
+---
+
+## 🚀 CI/CD & Automação de Releases (Codeberg)
+
+Este repositório possui suporte a automação de compilação e testes através do **Woodpecker CI** hospedado no Codeberg:
+
+* **Integração Contínua (CI):** A cada `push` ou `pull_request` enviado para a branch `main`, a suíte completa de testes é executada de forma automática (com paralelismo limitado a `-j 1` para respeitar as diretrizes de recursos compartilhados do Codeberg).
+* **Entrega Contínua (CD):** Ao criar e enviar uma tag de versão (ex: `v1.4.0`), o pipeline realiza a compilação do binário (`loophunter`) em modo de produção (Release) para Linux x86_64, compacta em um arquivo `.tar.gz` e anexa o arquivo final diretamente na página de Versões do repositório no Codeberg.

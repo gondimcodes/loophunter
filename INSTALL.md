@@ -2,6 +2,10 @@
 
 This document details the steps required to compile and install **LoopHunter** on your Linux environment.
 
+## Pre-compiled Binaries
+
+If you are on Linux x86_64, you can skip compiling from source and download pre-compiled release binaries directly from the **Versões (Releases)** page on [Codeberg](https://codeberg.org/gondim/loophunter/releases).
+
 ## Prerequisites
 
 To compile LoopHunter, you will need the Rust compiler and the Cargo package manager.
