@@ -133,9 +133,9 @@ The `<` character indicates that the previous loop on IP `198.18.0.15` was resol
 
 ---
 
-## 🚀 CI/CD & Automação de Releases (Codeberg)
+## 🚀 CI/CD & Release Automation (Codeberg)
 
-Este repositório possui suporte a automação de compilação e testes através do **Woodpecker CI** hospedado no Codeberg:
+This repository supports build and test automation via **Woodpecker CI** hosted on Codeberg:
 
-* **Integração Contínua (CI):** A cada `push` ou `pull_request` enviado para a branch `main`, a suíte completa de testes é executada de forma automática (com paralelismo limitado a `-j 1` para respeitar as diretrizes de recursos compartilhados do Codeberg).
-* **Entrega Contínua (CD):** Ao criar e enviar uma tag de versão (ex: `v1.4.0`), o pipeline realiza a compilação do binário (`loophunter`) em modo de produção (Release) para Linux x86_64, compacta em um arquivo `.tar.gz` e anexa o arquivo final diretamente na página de Versões do repositório no Codeberg.
+* **Continuous Integration (CI):** On every `push` or `pull_request` sent to the `main` branch, the complete test suite is executed automatically (with parallelism limited to `-j 1` to respect Codeberg's shared resource guidelines).
+* **Continuous Delivery (CD):** When creating and pushing a version tag (e.g., `v1.4.0`), the pipeline compiles the binary (`loophunter`) in production mode (Release) for Linux x86_64, compresses it into a `.tar.gz` file, and attaches the final file directly to the Releases page on Codeberg.
